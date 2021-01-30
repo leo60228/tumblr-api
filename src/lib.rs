@@ -1,7 +1,9 @@
 use anyhow::{anyhow, Result};
+use derive_more::From;
 use http_types::{Method, Url};
 use mime::MediaType;
 use oauth_1a::*;
+use pulldown_cmark::{Event, Tag};
 use reqwest::blocking::{
     multipart::{Form, Part},
     RequestBuilder,
@@ -50,7 +52,7 @@ pub struct Response<T: DeserializeOwned> {
     pub errors: Vec<ApiError>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TextBlockSubtype {
     Heading1,
@@ -63,10 +65,36 @@ pub enum TextBlockSubtype {
     UnorderedListItem,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct MentionedBlog {
+    pub uuid: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum FormattingType {
+    Bold,
+    Italic,
+    Strikethrough,
+    Link { url: String },
+    Mention { blog: MentionedBlog },
+    Color { hex: String },
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Formatting {
+    pub start: usize,
+    pub end: usize,
+    #[serde(flatten)]
+    pub typ: FormattingType,
+}
+
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct TextBlock {
     pub text: String,
     pub subtype: Option<TextBlockSubtype>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub formatting: Vec<Formatting>,
 }
 
 macro_rules! fromstr_display {
@@ -158,7 +186,7 @@ pub struct MediaUpload {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaFile {
-    Url(Url),
+    Url(String),
     Identifier(String),
 }
 
@@ -205,13 +233,191 @@ pub struct LinkBlock {
     pub poster: Option<MediaObject>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, From)]
 #[serde(tag = "type")]
 #[serde(rename_all = "lowercase")]
 pub enum PostContent {
     Text(TextBlock),
     Image(ImageBlock),
     Link(LinkBlock),
+}
+
+#[derive(Debug, Default)]
+pub struct PostRenderer {
+    blocks: Vec<PostContent>,
+    current_block: Option<TextBlock>,
+    formatting_queue: Vec<Formatting>,
+    in_bold_heading: bool,
+    list: Option<bool>,
+}
+
+impl PostRenderer {
+    pub fn new() -> Self {
+        Default::default()
+    }
+
+    pub fn finish(mut self) -> Vec<PostContent> {
+        if let Some(cur) = self.current_block {
+            self.blocks.push(cur.into());
+        }
+        self.blocks
+    }
+
+    fn split(&mut self) {
+        assert!(self.formatting_queue.is_empty());
+        if let Some(prev) = self.current_block.take() {
+            if prev.text != "" {
+                self.blocks.push(prev.into());
+            }
+        }
+        if let Some(ordered) = self.list {
+            self.current().subtype = Some(if ordered {
+                TextBlockSubtype::OrderedListItem
+            } else {
+                TextBlockSubtype::UnorderedListItem
+            });
+        }
+    }
+
+    fn current(&mut self) -> &mut TextBlock {
+        self.current_block.get_or_insert_with(Default::default)
+    }
+
+    fn start_formatting(&mut self, formatting: FormattingType) {
+        let start = self.current().text.len();
+        self.formatting_queue.push(Formatting {
+            start,
+            end: 0,
+            typ: formatting,
+        });
+    }
+
+    fn end_formatting(&mut self) {
+        let mut formatting = self.formatting_queue.pop().unwrap();
+        formatting.end = self.current().text.len();
+        self.current().formatting.push(formatting);
+    }
+
+    fn start_list(&mut self, ordered: bool) {
+        self.list = Some(ordered);
+        self.split();
+    }
+
+    fn start_tag(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph => {
+                if self.formatting_queue.is_empty() {
+                    self.split();
+                } else {
+                    self.current().text += "\n";
+                }
+            }
+            Tag::Heading(level) => {
+                if self.formatting_queue.is_empty() {
+                    self.split();
+                    self.current().subtype = Some(if level == 1 {
+                        TextBlockSubtype::Heading1
+                    } else {
+                        TextBlockSubtype::Heading2
+                    });
+                } else {
+                    self.current().text += "\n";
+                    self.start_formatting(FormattingType::Bold);
+                    self.in_bold_heading = true;
+                }
+            }
+            Tag::BlockQuote => {
+                if self.formatting_queue.is_empty() {
+                    self.split();
+                    self.current().subtype = Some(TextBlockSubtype::Quote);
+                }
+            }
+            Tag::CodeBlock(_) => {
+                self.split();
+                self.current().subtype = Some(TextBlockSubtype::Chat);
+            }
+            Tag::List(idx) => {
+                self.start_list(idx.is_some());
+            }
+            Tag::Item => self.split(),
+            Tag::FootnoteDefinition(_) => {}
+            Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
+            Tag::Emphasis => self.start_formatting(FormattingType::Italic),
+            Tag::Strong => self.start_formatting(FormattingType::Bold),
+            Tag::Strikethrough => self.start_formatting(FormattingType::Strikethrough),
+            Tag::Link(_, url, _) => self.start_formatting(FormattingType::Link {
+                url: url.into_string(),
+            }),
+            Tag::Image(_, url, _) => {
+                self.formatting_queue.clear(); // TODO: handle better
+                self.split();
+                self.blocks.push(PostContent::Image(ImageBlock {
+                    media: vec![MediaObject {
+                        file: MediaFile::Url(url.into_string()),
+                        mime_type: None,
+                        width: None,
+                        height: None,
+                        original_dimensions_missing: false,
+                        cropped: false,
+                        has_original_dimensions: false,
+                    }],
+                    ..Default::default()
+                }));
+            }
+        }
+    }
+
+    fn end_tag(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Paragraph => {}
+            Tag::Heading(_) => {
+                if self.in_bold_heading {
+                    self.end_formatting();
+                    self.in_bold_heading = false;
+                    self.current().text += "\n";
+                }
+            }
+            Tag::BlockQuote => {}
+            Tag::CodeBlock(_) => {}
+            Tag::List(_) => {
+                self.list = None;
+                self.split();
+            }
+            Tag::Item => {}
+            Tag::FootnoteDefinition(_) => {}
+            Tag::Table(_) | Tag::TableHead | Tag::TableRow | Tag::TableCell => {}
+            Tag::Emphasis => self.end_formatting(),
+            Tag::Strong => self.end_formatting(),
+            Tag::Strikethrough => self.end_formatting(),
+            Tag::Link(_, _, _) => self.end_formatting(),
+            Tag::Image(_, _, _) => {}
+        }
+    }
+
+    pub fn push(&mut self, event: Event<'_>) {
+        match event {
+            Event::Start(x) => self.start_tag(x),
+            Event::End(x) => self.end_tag(x),
+            Event::Text(x) => {
+                if self.current().subtype == Some(TextBlockSubtype::Chat) {
+                    self.current().text += &x.replace(" ", "\u{A0}");
+                } else {
+                    self.current().text += &x;
+                }
+            }
+            Event::Code(x) => {
+                self.split();
+                self.current().subtype = Some(TextBlockSubtype::Chat);
+                self.current().text = x.into_string();
+            }
+            Event::Html(_x) => todo!(),
+            Event::TaskListMarker(_) => {
+                self.start_list(false);
+                self.list = None;
+            }
+            _ => {}
+        }
+    }
 }
 
 impl<T: Debug + DeserializeOwned> From<Response<T>> for Result<T> {
@@ -439,11 +645,13 @@ impl Tumblr {
         &mut self,
         blog: String,
         content: Vec<PostContent>,
+        tags: Option<String>,
         media: HashMap<String, MediaUpload>,
     ) -> Result<u64> {
         #[derive(Debug, Serialize)]
         struct NewPost {
             pub content: Vec<PostContent>,
+            pub tags: Option<String>,
         }
 
         #[derive(Debug, Deserialize)]
@@ -452,7 +660,7 @@ impl Tumblr {
             pub id: u64,
         }
 
-        let new = NewPost { content };
+        let new = NewPost { content, tags };
         let mut form = Form::new().part(
             "json",
             Part::text(serde_json::to_string(&new)?).mime_str("application/json")?,
